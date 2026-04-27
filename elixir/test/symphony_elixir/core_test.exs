@@ -626,6 +626,80 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 99_000, 101_000)
   end
 
+  test "capability gap updates block the issue and stop the running agent" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    issue_id = "issue-capability-gap"
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    ref = Process.monitor(worker_pid)
+    orchestrator_name = Module.concat(__MODULE__, :CapabilityGapOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+        restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+
+        if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
+        if Process.alive?(pid), do: Process.exit(pid, :normal)
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: ref,
+        identifier: "MT-564",
+        issue: %Issue{id: issue_id, identifier: "MT-564", state: "In Progress"},
+        session_id: nil,
+        worker_host: nil,
+        workspace_path: nil,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {
+        :codex_worker_update,
+        issue_id,
+        %{
+          event: :tool_call_failed,
+          timestamp: DateTime.utc_now(),
+          tool_name: "linear_graphql",
+          result: %{
+            "success" => false,
+            "output" => ~s({"error":{"message":"Unsupported dynamic tool: \\"linear_create_issue\\"."}})
+          }
+        }
+      })
+
+      assert_receive {:memory_tracker_comment, ^issue_id, body}, 500
+      assert body =~ "Symphony blocked this issue"
+      assert body =~ "Missing capability: tool"
+      assert body =~ "Unsupported dynamic tool"
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 500
+
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+      refute Process.alive?(worker_pid)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+    end
+  end
+
   test "credit pause retry keeps waiting for the same non-terminal issue state" do
     previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
     issue_id = "issue-credit-resume"
