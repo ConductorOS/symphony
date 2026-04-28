@@ -12,6 +12,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @credit_retry_default_delay_ms 3_600_000
+  @credit_retry_min_delay_ms 60_000
+  @credit_retry_safety_margin_ms 5_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -132,28 +135,40 @@ defmodule SymphonyElixir.Orchestrator do
         state =
           case reason do
             :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+              if credit_exhausted_running_entry?(running_entry) do
+                Logger.warning("Agent task paused for issue_id=#{issue_id} session_id=#{session_id}; Codex credits are exhausted")
 
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+                schedule_credit_exhausted_retry(state, issue_id, running_entry)
+              else
+                Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+                state
+                |> complete_issue(issue_id)
+                |> schedule_issue_retry(issue_id, 1, %{
+                  identifier: running_entry.identifier,
+                  delay_type: :continuation,
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                })
+              end
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+              if credit_exhausted_running_entry?(running_entry) or credit_exhausted_reason?(reason) do
+                Logger.warning("Agent task paused for issue_id=#{issue_id} session_id=#{session_id}; Codex credits appear exhausted reason=#{inspect(reason)}")
 
-              next_attempt = next_retry_attempt_from_running(running_entry)
+                schedule_credit_exhausted_retry(state, issue_id, running_entry)
+              else
+                Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
+                next_attempt = next_retry_attempt_from_running(running_entry)
+
+                schedule_issue_retry(state, issue_id, next_attempt, %{
+                  identifier: running_entry.identifier,
+                  error: "agent exited: #{inspect(reason)}",
+                  worker_host: Map.get(running_entry, :worker_host),
+                  workspace_path: Map.get(running_entry, :workspace_path)
+                })
+              end
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -718,6 +733,8 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            credit_exhausted: false,
+            credit_retry_delay_ms: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -770,6 +787,20 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp schedule_credit_exhausted_retry(%State{} = state, issue_id, running_entry) do
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: Map.get(running_entry, :identifier),
+      delay_type: :credit_exhausted,
+      retry_after_ms: Map.get(running_entry, :credit_retry_delay_ms),
+      issue_state: running_entry_issue_state(running_entry),
+      error: "codex credits exhausted",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -803,6 +834,9 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            delay_type: metadata[:delay_type],
+            retry_after_ms: metadata[:retry_after_ms],
+            issue_state: metadata[:issue_state],
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -815,6 +849,9 @@ defmodule SymphonyElixir.Orchestrator do
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
+          delay_type: Map.get(retry_entry, :delay_type),
+          retry_after_ms: Map.get(retry_entry, :retry_after_ms),
+          issue_state: Map.get(retry_entry, :issue_state),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
         }
@@ -855,6 +892,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
+
+      credit_exhausted_retry?(metadata) and credit_pause_resume_candidate_issue?(issue, metadata, terminal_states) ->
+        handle_credit_pause_retry(state, issue, attempt, metadata)
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -921,15 +961,40 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp handle_credit_pause_retry(state, issue, attempt, metadata) do
+    if dispatch_slots_available?(issue, state) and worker_slots_available?(state, metadata[:worker_host]) do
+      Logger.info("Retrying issue after Codex credit pause: #{issue_context(issue)} state=#{issue.state}")
+      {:noreply, do_dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+    else
+      Logger.debug("No available slots for retrying credit-paused #{issue_context(issue)}; retrying again")
+
+      {:noreply,
+       schedule_issue_retry(
+         state,
+         issue.id,
+         attempt + 1,
+         Map.merge(metadata, %{
+           identifier: issue.identifier,
+           error: "no available orchestrator slots"
+         })
+       )}
+    end
+  end
+
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :credit_exhausted ->
+        credit_retry_delay(metadata[:retry_after_ms])
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -937,6 +1002,12 @@ defmodule SymphonyElixir.Orchestrator do
     max_delay_power = min(attempt - 1, 10)
     min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
   end
+
+  defp credit_retry_delay(delay_ms) when is_integer(delay_ms) and delay_ms > 0 do
+    max(delay_ms, @credit_retry_min_delay_ms)
+  end
+
+  defp credit_retry_delay(_delay_ms), do: @credit_retry_default_delay_ms
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
   defp normalize_retry_attempt(_attempt), do: 0
@@ -1053,6 +1124,32 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp running_entry_session_id(_running_entry), do: "n/a"
+
+  defp credit_exhausted_running_entry?(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :credit_exhausted) == true
+  end
+
+  defp credit_exhausted_running_entry?(_running_entry), do: false
+
+  defp credit_exhausted_reason?(reason) do
+    reason
+    |> inspect()
+    |> String.downcase()
+    |> then(fn reason_text ->
+      String.contains?(reason_text, [
+        "has_credits",
+        "credit",
+        "insufficient_quota",
+        "quota exceeded",
+        "rate limit",
+        "rate_limit",
+        "tokens exhausted"
+      ])
+    end)
+  end
+
+  defp running_entry_issue_state(%{issue: %Issue{state: state}}) when is_binary(state), do: state
+  defp running_entry_issue_state(_running_entry), do: nil
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
@@ -1171,6 +1268,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
+    {credit_exhausted, credit_retry_delay_ms} = credit_state_for_update(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
@@ -1193,6 +1291,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        credit_exhausted: credit_exhausted,
+        credit_retry_delay_ms: credit_retry_delay_ms,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1234,6 +1334,105 @@ defmodule SymphonyElixir.Orchestrator do
        do: existing_count
 
   defp turn_count_for_update(_existing_count, _existing_session_id, _update), do: 0
+
+  defp credit_state_for_update(running_entry, update) do
+    case extract_rate_limits(update) do
+      %{} = rate_limits ->
+        if codex_credits_exhausted?(rate_limits) do
+          {true, credit_retry_delay_from_rate_limits(rate_limits)}
+        else
+          {false, nil}
+        end
+
+      _ ->
+        {Map.get(running_entry, :credit_exhausted, false), Map.get(running_entry, :credit_retry_delay_ms)}
+    end
+  end
+
+  defp codex_credits_exhausted?(rate_limits) when is_map(rate_limits) do
+    case map_value(rate_limits, ["credits", :credits]) do
+      %{} = credits ->
+        unlimited = map_value(credits, ["unlimited", :unlimited]) == true
+        has_credits = map_value(credits, ["has_credits", :has_credits])
+        balance = map_value(credits, ["balance", :balance])
+
+        !unlimited and (has_credits == false or zero_balance?(balance))
+
+      _ ->
+        false
+    end
+  end
+
+  defp codex_credits_exhausted?(_rate_limits), do: false
+
+  defp zero_balance?(0), do: true
+  defp zero_balance?(balance) when is_float(balance), do: balance == 0.0
+  defp zero_balance?("0"), do: true
+  defp zero_balance?(_balance), do: false
+
+  defp credit_retry_delay_from_rate_limits(rate_limits) do
+    rate_limits
+    |> rate_limit_buckets()
+    |> Enum.find_value(&retry_delay_from_bucket/1)
+  end
+
+  defp rate_limit_buckets(rate_limits) when is_map(rate_limits) do
+    ["credits", :credits, "primary", :primary, "secondary", :secondary]
+    |> Enum.map(&Map.get(rate_limits, &1))
+    |> Enum.filter(&is_map/1)
+  end
+
+  defp rate_limit_buckets(_rate_limits), do: []
+
+  defp retry_delay_from_bucket(bucket) when is_map(bucket) do
+    reset_value =
+      map_value(bucket, [
+        "reset_in_seconds",
+        :reset_in_seconds,
+        "resetInSeconds",
+        :resetInSeconds,
+        "retry_after_seconds",
+        :retry_after_seconds,
+        "retryAfterSeconds",
+        :retryAfterSeconds,
+        "reset_at",
+        :reset_at,
+        "resetAt",
+        :resetAt,
+        "resets_at",
+        :resets_at,
+        "resetsAt",
+        :resetsAt
+      ])
+
+    reset_delay_ms(reset_value)
+  end
+
+  defp retry_delay_from_bucket(_bucket), do: nil
+
+  defp reset_delay_ms(value) when is_integer(value) and value >= 0 do
+    value * 1_000 + @credit_retry_safety_margin_ms
+  end
+
+  defp reset_delay_ms(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    with {seconds, ""} <- Integer.parse(trimmed) do
+      reset_delay_ms(seconds)
+    else
+      _ ->
+        case DateTime.from_iso8601(trimmed) do
+          {:ok, reset_at, _offset} ->
+            max(0, DateTime.diff(reset_at, DateTime.utc_now(), :millisecond)) +
+              @credit_retry_safety_margin_ms
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  defp reset_delay_ms(_value), do: nil
 
   defp summarize_codex_update(update) do
     %{
@@ -1307,6 +1506,29 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
+
+  defp credit_pause_resume_candidate_issue?(%Issue{} = issue, metadata, terminal_states) do
+    issue_routable_to_worker?(issue) and
+      !terminal_issue_state?(issue.state, terminal_states) and
+      same_issue_state?(issue.state, metadata[:issue_state])
+  end
+
+  defp credit_pause_resume_candidate_issue?(_issue, _metadata, _terminal_states), do: false
+
+  defp same_issue_state?(state_name, expected_state) when is_binary(state_name) and is_binary(expected_state) do
+    normalize_issue_state(state_name) == normalize_issue_state(expected_state)
+  end
+
+  defp same_issue_state?(state_name, _expected_state) when is_binary(state_name) do
+    active_issue_state?(state_name, active_state_set())
+  end
+
+  defp same_issue_state?(_state_name, _expected_state), do: false
+
+  defp credit_exhausted_retry?(metadata) when is_map(metadata),
+    do: metadata[:delay_type] == :credit_exhausted
+
+  defp credit_exhausted_retry?(_metadata), do: false
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
@@ -1549,6 +1771,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp map_at_path(_payload, _path), do: nil
+
+  defp map_value(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, &Map.get(map, &1))
+  end
+
+  defp map_value(_map, _keys), do: nil
 
   defp integer_token_map?(payload) do
     token_fields = [
