@@ -444,6 +444,49 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "dispatch moves pickup issues to in progress before starting work" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_memory_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+    issue_id = "issue-start-state"
+    orchestrator_name = Module.concat(__MODULE__, :StartStateOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Approved"],
+        tracker_continuation_states: ["Todo", "Approved", "In Progress", "In Review"],
+        max_concurrent_agents: 1,
+        codex_command: "/bin/false app-server"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{
+          id: issue_id,
+          identifier: "MT-567",
+          state: "Todo",
+          title: "Start work",
+          description: "Move state before Codex starts",
+          labels: []
+        }
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      assert_receive {:memory_tracker_state_update, ^issue_id, "In Progress"}, 500
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      restore_app_env(:memory_tracker_recipient, previous_memory_recipient)
+    end
+  end
+
   test "terminal issue state stops running agent and cleans workspace" do
     test_root =
       Path.join(
