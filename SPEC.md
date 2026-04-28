@@ -575,6 +575,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
+- `tracker.continuation_states`: optional list of strings for already-running sessions; defaults to
+  dispatch states when omitted
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
@@ -720,6 +722,8 @@ An issue is dispatch-eligible only if all are true:
 
 - It has `id`, `identifier`, `title`, and `state`.
 - Its state is in `active_states` and not in `terminal_states`.
+- `continuation_states` do not make new issues dispatch-eligible; they only keep an already-running
+  session alive while a workflow moves through intermediate states such as `In Progress` or review.
 - It is not already in `running`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
@@ -1595,7 +1599,8 @@ Operators can control behavior by:
   Section 6.2.
 - Changing issue states in the tracker:
   - terminal state -> running session is stopped and workspace cleaned when reconciled
-  - non-active state -> running session is stopped without cleanup
+  - continuation state -> running session is kept alive and its issue snapshot is refreshed
+  - state outside continuation states -> running session is stopped without cleanup
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
 
@@ -1755,7 +1760,7 @@ function reconcile_running_issues(state):
   for issue in refreshed:
     if issue.state in terminal_states:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
+    else if issue.state in continuation_states:
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
