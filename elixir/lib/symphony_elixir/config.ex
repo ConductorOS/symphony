@@ -6,6 +6,8 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Workflow
 
+  @backlog_state "Backlog"
+
   @default_prompt_template """
   You are working on a Linear issue.
 
@@ -60,6 +62,17 @@ defmodule SymphonyElixir.Config do
   end
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
+
+  @spec tracker_dispatch_states() :: [String.t()]
+  def tracker_dispatch_states do
+    tracker = settings!().tracker
+
+    if tracker.skip_backlog_triage do
+      Enum.uniq([@backlog_state | tracker.active_states])
+    else
+      tracker.active_states
+    end
+  end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
