@@ -422,6 +422,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
 
+        if skill_load_error?(payload_string) do
+          emit_message(
+            on_message,
+            :skill_load_failed,
+            %{
+              payload: payload_string,
+              raw: payload_string
+            },
+            metadata_from_message(port, %{raw: payload_string})
+          )
+        end
+
         if protocol_message_candidate?(payload_string) do
           emit_message(
             on_message,
@@ -575,7 +587,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> :tool_call_failed
       end
 
-    emit_message(on_message, event, %{payload: payload, raw: payload_string}, metadata)
+    emit_message(
+      on_message,
+      event,
+      %{
+        payload: payload,
+        raw: payload_string,
+        tool_name: tool_name,
+        arguments: arguments,
+        result: result
+      },
+      metadata
+    )
 
     :approved
   end
@@ -984,6 +1007,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> to_string()
     |> String.trim_leading()
     |> String.starts_with?("{")
+  end
+
+  defp skill_load_error?(data) do
+    data
+    |> to_string()
+    |> String.contains?("failed to load skill")
   end
 
   defp issue_context(%{id: issue_id, identifier: identifier}) do

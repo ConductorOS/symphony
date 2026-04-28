@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Orchestrator do
   @credit_retry_default_delay_ms 3_600_000
   @credit_retry_min_delay_ms 60_000
   @credit_retry_safety_margin_ms 5_000
+  @blocked_state_name "Blocked"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -211,8 +212,19 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+
+        state =
+          case capability_gap_from_update(update) do
+            nil ->
+              state
+
+            capability_gap ->
+              block_issue_for_capability_gap(state, issue_id, updated_running_entry, capability_gap)
+          end
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -458,6 +470,40 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         release_issue_claim(state, issue_id)
     end
+  end
+
+  defp block_issue_for_capability_gap(%State{} = state, issue_id, running_entry, {kind, details}) do
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    body = capability_gap_comment(kind, details)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to comment capability gap for issue_id=#{issue_id} issue_identifier=#{identifier}: #{inspect(reason)}")
+    end
+
+    case Tracker.update_issue_state(issue_id, @blocked_state_name) do
+      :ok ->
+        Logger.warning("Blocked issue after agent capability gap: issue_id=#{issue_id} issue_identifier=#{identifier} missing=#{kind}")
+
+      {:error, reason} ->
+        Logger.warning("Failed to move capability gap issue to #{@blocked_state_name}: issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)}")
+    end
+
+    terminate_running_issue(state, issue_id, false)
+  end
+
+  defp capability_gap_comment(kind, details) do
+    """
+    Symphony blocked this issue because the agent is missing a required capability.
+
+    Missing capability: #{kind}
+    Details: #{details}
+
+    The run was stopped to avoid token-consuming workarounds. Fix the missing tool, skill, or permission, then move the issue back to an active pickup state.
+    """
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
@@ -1441,6 +1487,66 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp capability_gap_from_update(%{event: :skill_load_failed} = update) do
+    {:skill, update_text(update)}
+  end
+
+  defp capability_gap_from_update(%{event: :approval_required} = update) do
+    {:permission, "Codex requested approval during an unattended run: #{update_text(update)}"}
+  end
+
+  defp capability_gap_from_update(%{event: :turn_input_required} = update) do
+    {:permission, "Codex required interactive input during an unattended run: #{update_text(update)}"}
+  end
+
+  defp capability_gap_from_update(%{event: :unsupported_tool_call} = update) do
+    tool_name = update[:tool_name] || "<unknown>"
+    {:tool, "Unsupported tool requested: #{tool_name}. #{update_text(update)}"}
+  end
+
+  defp capability_gap_from_update(%{event: :tool_call_failed} = update) do
+    if capability_gap_text?(update_text(update)) do
+      tool_name = update[:tool_name] || "<unknown>"
+      {:tool, "Tool call failed because a capability appears unavailable: #{tool_name}. #{update_text(update)}"}
+    end
+  end
+
+  defp capability_gap_from_update(_update), do: nil
+
+  defp capability_gap_text?(text) when is_binary(text) do
+    String.match?(
+      String.downcase(text),
+      ~r/(unsupported dynamic tool|approval required|not authorized|unauthori[sz]ed|forbidden|permission denied|operation not permitted|access denied|missing (tool|skill|permission|credential|api key|token)|api key.*missing|token.*missing|authentication required)/
+    )
+  end
+
+  defp capability_gap_text?(_text), do: false
+
+  defp update_text(update) when is_map(update) do
+    update
+    |> capability_gap_parts()
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(" ")
+    |> String.slice(0, 2_000)
+  end
+
+  defp capability_gap_parts(update) do
+    [
+      update[:raw],
+      update[:payload],
+      update[:details],
+      update[:result],
+      update[:message]
+    ]
+    |> Enum.map(&capability_gap_part/1)
+  end
+
+  defp capability_gap_part(value) when is_binary(value), do: value
+  defp capability_gap_part(value) when is_map(value), do: Jason.encode!(value)
+  defp capability_gap_part(value) when is_list(value), do: Jason.encode!(value)
+  defp capability_gap_part(value) when is_nil(value), do: nil
+  defp capability_gap_part(value), do: inspect(value)
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do
