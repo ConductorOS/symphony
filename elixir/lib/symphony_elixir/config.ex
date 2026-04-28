@@ -74,6 +74,12 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec tracker_continuation_states() :: [String.t()]
+  def tracker_continuation_states do
+    tracker = settings!().tracker
+    tracker.continuation_states || tracker_dispatch_states()
+  end
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

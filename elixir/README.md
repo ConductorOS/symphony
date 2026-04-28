@@ -83,6 +83,12 @@ Optional flags:
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
+Tracker state configuration separates new dispatch from existing session continuation:
+
+- `tracker.active_states` controls which issues can start a new worker.
+- `tracker.continuation_states` controls which non-terminal states keep an already-running worker
+  alive, for example while an issue moves from implementation into review.
+
 Minimal example:
 
 ```md

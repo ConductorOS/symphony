@@ -7,6 +7,12 @@ tracker:
     - In Progress
     - Merging
     - Rework
+  continuation_states:
+    - Todo
+    - In Progress
+    - Human Review
+    - Merging
+    - Rework
   terminal_states:
     - Closed
     - Cancelled

@@ -14,9 +14,19 @@ defmodule SymphonyElixir.CoreTest do
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
-    assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert config.tracker.continuation_states == nil
+
+    assert config.tracker.terminal_states == [
+             "Closed",
+             "Cancelled",
+             "Canceled",
+             "Duplicate",
+             "Done"
+           ]
+
     assert config.tracker.skip_backlog_triage == false
     assert Config.tracker_dispatch_states() == ["Todo", "In Progress"]
+    assert Config.tracker_continuation_states() == ["Todo", "In Progress"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
 
@@ -42,6 +52,21 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_skip_backlog_triage: true)
     assert Config.settings!().tracker.skip_backlog_triage == true
     assert Config.tracker_dispatch_states() == ["Backlog", "Todo", "In Progress"]
+    assert Config.tracker_continuation_states() == ["Backlog", "Todo", "In Progress"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Approved"],
+      tracker_continuation_states: ["Todo", "Approved", "In Progress", "In Review"]
+    )
+
+    assert Config.tracker_dispatch_states() == ["Todo", "Approved"]
+
+    assert Config.tracker_continuation_states() == [
+             "Todo",
+             "Approved",
+             "In Progress",
+             "In Review"
+           ]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -70,7 +95,10 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "/bin/sh app-server")
     assert :ok = Config.validate!()
 
-    write_workflow_file!(Workflow.workflow_file_path(), codex_approval_policy: "definitely-not-valid")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_approval_policy: "definitely-not-valid"
+    )
+
     assert :ok = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_thread_sandbox: "unsafe-ish")
@@ -111,10 +139,15 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
+
+    assert Map.get(hooks, "after_create") =~
+             "git clone --depth 1 https://github.com/openai/symphony ."
+
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+
+    assert Map.get(hooks, "before_remove") =~
+             "cd elixir && mise exec -- mix workspace.before_remove"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -180,7 +213,9 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "workflow load accepts prompt-only files without front matter" do
-    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
+    workflow_path =
+      Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
+
     File.write!(workflow_path, "Prompt only\n")
 
     assert {:ok, %{config: %{}, prompt: "Prompt only", prompt_template: "Prompt only"}} =
@@ -188,15 +223,20 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "workflow load accepts unterminated front matter with an empty prompt" do
-    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
+    workflow_path =
+      Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
+
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
 
-    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
+    assert {:ok,
+            %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
              Workflow.load(workflow_path)
   end
 
   test "workflow load rejects non-map front matter" do
-    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "INVALID_FRONT_MATTER_WORKFLOW.md")
+    workflow_path =
+      Path.join(Path.dirname(Workflow.workflow_file_path()), "INVALID_FRONT_MATTER_WORKFLOW.md")
+
     File.write!(workflow_path, "---\n- not-a-map\n---\nPrompt body\n")
 
     assert {:error, :workflow_front_matter_not_a_map} = Workflow.load(workflow_path)
@@ -217,7 +257,8 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     if is_pid(orchestrator_pid) do
-      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+      assert :ok =
+               Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
     end
 
     assert {:ok, pid} = SymphonyElixir.start_link()
@@ -290,6 +331,117 @@ defmodule SymphonyElixir.CoreTest do
       assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  test "continuation issue states keep an existing running agent alive without becoming pickup states" do
+    issue_id = "issue-continuation"
+    issue_identifier = "MT-565"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "Approved"],
+      tracker_continuation_states: ["Todo", "Approved", "In Progress", "In Review"],
+      tracker_terminal_states: ["Done", "Cancelled"]
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "Todo", identifier: issue_identifier},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "In Progress",
+      title: "Work underway",
+      description: "Already claimed",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+    assert updated_state.running[issue_id].issue.state == "In Progress"
+    refute Orchestrator.should_dispatch_issue_for_test(issue, %Orchestrator.State{})
+
+    Process.exit(agent_pid, :normal)
+  end
+
+  test "production reconcile keeps running agents alive in continuation states" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-production-continuation"
+    issue_identifier = "MT-566"
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Approved"],
+        tracker_continuation_states: ["Todo", "Approved", "In Progress", "In Review"],
+        tracker_terminal_states: ["Done", "Cancelled"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{
+          id: issue_id,
+          identifier: issue_identifier,
+          state: "In Progress",
+          title: "Work underway",
+          description: "Already claimed",
+          labels: []
+        }
+      ])
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "Todo", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      updated_state = Orchestrator.reconcile_running_issues_for_test(state)
+
+      assert Map.has_key?(updated_state.running, issue_id)
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
+      assert updated_state.running[issue_id].issue.state == "In Progress"
+
+      Process.exit(agent_pid, :normal)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
     end
   end
 
@@ -683,7 +835,8 @@ defmodule SymphonyElixir.CoreTest do
           tool_name: "linear_graphql",
           result: %{
             "success" => false,
-            "output" => ~s({"error":{"message":"Unsupported dynamic tool: \\"linear_create_issue\\"."}})
+            "output" =>
+              ~s({"error":{"message":"Unsupported dynamic tool: \\"linear_create_issue\\"."}})
           }
         }
       })
@@ -928,7 +1081,9 @@ defmodule SymphonyElixir.CoreTest do
              Orchestrator.handle_call(:request_refresh, {self(), make_ref()}, refreshed_state)
 
     assert coalesced_state.tick_token == refreshed_state.tick_token
-    assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
+
+    assert {:noreply, ^coalesced_state} =
+             Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
   end
 
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
@@ -1015,7 +1170,8 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
-    workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
+    workflow_prompt =
+      "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
 
@@ -1152,9 +1308,12 @@ defmodule SymphonyElixir.CoreTest do
       end
     end)
 
-    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
+    assert :ok =
+             Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
 
-    Workflow.set_workflow_file_path(Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md"))
+    Workflow.set_workflow_file_path(
+      Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md")
+    )
 
     issue = %Issue{
       identifier: "MT-780",

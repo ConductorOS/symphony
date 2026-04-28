@@ -51,7 +51,12 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
-      field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
+      field(:continuation_states, {:array, :string})
+
+      field(:terminal_states, {:array, :string},
+        default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
       field(:skip_backlog_triage, :boolean, default: false)
     end
 
@@ -67,6 +72,7 @@ defmodule SymphonyElixir.Config.Schema do
           :project_slug,
           :assignee,
           :active_states,
+          :continuation_states,
           :terminal_states,
           :skip_backlog_triage
         ],
@@ -149,7 +155,12 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
@@ -226,7 +237,9 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
+      |> cast(attrs, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms],
+        empty_values: []
+      )
       |> validate_number(:timeout_ms, greater_than: 0)
     end
   end
@@ -378,13 +391,19 @@ defmodule SymphonyElixir.Config.Schema do
   defp finalize_settings(settings) do
     tracker = %{
       settings.tracker
-      | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+      | api_key:
+          resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
+        assignee:
+          resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root:
+          resolve_path_value(
+            settings.workspace.root,
+            Path.join(System.tmp_dir!(), "symphony_workspaces")
+          )
     }
 
     codex = %{
@@ -532,7 +551,11 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp git_metadata_root(workspace_root, git_rev_parse_arg) do
-    case System.cmd("git", ["-C", workspace_root, "rev-parse", "--path-format=absolute", git_rev_parse_arg], stderr_to_stdout: true) do
+    case System.cmd(
+           "git",
+           ["-C", workspace_root, "rev-parse", "--path-format=absolute", git_rev_parse_arg],
+           stderr_to_stdout: true
+         ) do
       {path, 0} ->
         path
         |> String.trim()
