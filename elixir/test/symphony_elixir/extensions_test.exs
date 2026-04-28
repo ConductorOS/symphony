@@ -193,8 +193,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert {:ok, created_issue} = SymphonyElixir.Tracker.create_issue(%{title: "Fix blocker"})
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_issue_create, %{title: "Fix blocker"}, ^created_issue}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
@@ -243,6 +245,51 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "team" => %{
+                 "id" => "team-1",
+                 "states" => %{"nodes" => [%{"id" => "state-backlog"}]}
+               },
+               "project" => %{"id" => "project-1"}
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issueCreate" => %{
+               "success" => true,
+               "issue" => %{"id" => "created-1", "identifier" => "MT-999", "url" => "https://linear.test/MT-999"}
+             }
+           }
+         }}
+      ]
+    )
+
+    assert {:ok, %{"identifier" => "MT-999"}} =
+             Adapter.create_issue(%{
+               source_issue_id: "issue-1",
+               title: "Fix missing tool",
+               description: "Install the tool"
+             })
+
+    assert_receive {:graphql_called, issue_context_query, %{issueId: "issue-1", stateName: "Backlog"}}
+    assert issue_context_query =~ "SymphonyIssueContext"
+
+    assert_receive {:graphql_called, create_issue_query, %{input: input}}
+    assert create_issue_query =~ "issueCreate"
+    assert input.teamId == "team-1"
+    assert input.projectId == "project-1"
+    assert input.stateId == "state-backlog"
+    assert input.title == "Fix missing tool"
+    assert input.description == "Install the tool"
 
     Process.put(
       {FakeLinearClient, :graphql_results},
