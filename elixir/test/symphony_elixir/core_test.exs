@@ -554,6 +554,154 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "normal worker exit with exhausted Codex credits schedules a credit pause retry" do
+    issue_id = "issue-credit-pause"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CreditPauseOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: %Issue{id: issue_id, identifier: "MT-562", state: "In Progress"},
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :turn_completed,
+        timestamp: DateTime.utc_now(),
+        payload: %{
+          "method" => "turn/completed",
+          "rate_limits" => %{
+            "limit_id" => "gpt-5",
+            "primary" => %{"reset_in_seconds" => 95},
+            "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => 0}
+          }
+        }
+      }
+    })
+
+    Process.sleep(50)
+    assert :sys.get_state(pid).running[issue_id].credit_exhausted == true
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute MapSet.member?(state.completed, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             attempt: 1,
+             delay_type: :credit_exhausted,
+             retry_after_ms: 100_000,
+             issue_state: "In Progress",
+             error: "codex credits exhausted",
+             due_at_ms: due_at_ms
+           } = state.retry_attempts[issue_id]
+
+    assert_due_in_range(due_at_ms, 99_000, 101_000)
+  end
+
+  test "credit pause retry keeps waiting for the same non-terminal issue state" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-credit-resume"
+    retry_token = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CreditResumeOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        tracker_active_states: ["Todo", "Approved"],
+        tracker_terminal_states: ["Done", "Cancelled"]
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{
+          id: issue_id,
+          identifier: "MT-563",
+          title: "Resume after credits",
+          description: "Same state should remain retryable",
+          state: "In Progress",
+          labels: []
+        }
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:max_concurrent_agents, 0)
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{
+          issue_id => %{
+            attempt: 1,
+            timer_ref: nil,
+            retry_token: retry_token,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: "MT-563",
+            delay_type: :credit_exhausted,
+            retry_after_ms: 90_000,
+            issue_state: "In Progress",
+            error: "codex credits exhausted"
+          }
+        })
+      end)
+
+      send(pid, {:retry_issue, issue_id, retry_token})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      assert MapSet.member?(state.claimed, issue_id)
+
+      assert %{
+               attempt: 2,
+               delay_type: :credit_exhausted,
+               retry_after_ms: 90_000,
+               issue_state: "In Progress",
+               error: "no available orchestrator slots",
+               due_at_ms: due_at_ms
+             } = state.retry_attempts[issue_id]
+
+      assert_due_in_range(due_at_ms, 89_000, 91_000)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
