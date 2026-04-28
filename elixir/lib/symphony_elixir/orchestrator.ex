@@ -16,6 +16,7 @@ defmodule SymphonyElixir.Orchestrator do
   @credit_retry_min_delay_ms 60_000
   @credit_retry_safety_margin_ms 5_000
   @blocked_state_name "Blocked"
+  @in_progress_state_name "In Progress"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -813,8 +814,50 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case mark_issue_in_progress(issue) do
+          {:ok, issue} ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+
+          {:error, reason} ->
+            block_issue_before_dispatch(state, issue, reason)
+        end
     end
+  end
+
+  defp mark_issue_in_progress(%Issue{state: @in_progress_state_name} = issue), do: {:ok, issue}
+
+  defp mark_issue_in_progress(%Issue{id: issue_id} = issue) when is_binary(issue_id) do
+    case Tracker.update_issue_state(issue_id, @in_progress_state_name) do
+      :ok ->
+        {:ok, %{issue | state: @in_progress_state_name}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp mark_issue_in_progress(issue), do: {:ok, issue}
+
+  defp block_issue_before_dispatch(%State{} = state, %Issue{} = issue, reason) do
+    message = """
+    Symphony blocked this issue before dispatch because it could not move the issue to #{@in_progress_state_name}.
+
+    Missing or failing capability: tracker state update
+    Reason: #{inspect(reason)}
+
+    The run was stopped before starting Codex work to avoid token-consuming work outside the expected Linear lifecycle.
+    """
+
+    _ = Tracker.create_comment(issue.id, String.trim(message))
+    _ = Tracker.update_issue_state(issue.id, @blocked_state_name)
+
+    Logger.error("Unable to move issue to #{@in_progress_state_name} before dispatch for #{issue_context(issue)}: #{inspect(reason)}")
+
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, issue.id)
+    }
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
