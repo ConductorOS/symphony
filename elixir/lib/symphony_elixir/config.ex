@@ -77,7 +77,11 @@ defmodule SymphonyElixir.Config do
   @spec tracker_continuation_states() :: [String.t()]
   def tracker_continuation_states do
     tracker = settings!().tracker
-    tracker.continuation_states || tracker_dispatch_states()
+
+    case tracker.continuation_states do
+      states when is_list(states) and states != [] -> states
+      _ -> tracker_dispatch_states()
+    end
   end
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()

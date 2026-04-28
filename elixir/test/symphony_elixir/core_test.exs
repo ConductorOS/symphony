@@ -228,8 +228,7 @@ defmodule SymphonyElixir.CoreTest do
 
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
 
-    assert {:ok,
-            %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
+    assert {:ok, %{config: %{"tracker" => %{"kind" => "linear"}}, prompt: "", prompt_template: ""}} =
              Workflow.load(workflow_path)
   end
 
@@ -835,8 +834,7 @@ defmodule SymphonyElixir.CoreTest do
           tool_name: "linear_graphql",
           result: %{
             "success" => false,
-            "output" =>
-              ~s({"error":{"message":"Unsupported dynamic tool: \\"linear_create_issue\\"."}})
+            "output" => ~s({"error":{"message":"Unsupported dynamic tool: \\"linear_create_issue\\"."}})
           }
         }
       })
@@ -846,6 +844,13 @@ defmodule SymphonyElixir.CoreTest do
       assert body =~ "Missing capability: tool"
       assert body =~ "Unsupported dynamic tool"
       assert_receive {:memory_tracker_state_update, ^issue_id, "Blocked"}, 500
+      assert_receive {:memory_tracker_issue_create, attrs, created_issue}, 500
+      assert attrs.source_issue_id == issue_id
+      assert attrs.state_name == "Backlog"
+      assert attrs.title == "Fix Symphony capability gap for MT-564"
+      assert attrs.description =~ "Symphony stopped MT-564"
+      assert attrs.description =~ "Unsupported dynamic tool"
+      assert is_binary(created_issue.identifier)
 
       Process.sleep(50)
       state = :sys.get_state(pid)
@@ -1311,9 +1316,7 @@ defmodule SymphonyElixir.CoreTest do
     assert :ok =
              Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
 
-    Workflow.set_workflow_file_path(
-      Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md")
-    )
+    Workflow.set_workflow_file_path(Path.join(System.tmp_dir!(), "missing-workflow-#{System.unique_integer([:positive])}.md"))
 
     issue = %Issue{
       identifier: "MT-780",

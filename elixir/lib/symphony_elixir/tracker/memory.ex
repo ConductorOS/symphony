@@ -41,6 +41,19 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec create_issue(map()) :: {:ok, map()} | {:error, term()}
+  def create_issue(attrs) when is_map(attrs) do
+    issue = %{
+      id: Map.get(attrs, :id, "created-#{System.unique_integer([:positive])}"),
+      identifier: Map.get(attrs, :identifier, "MEM-#{System.unique_integer([:positive])}"),
+      title: Map.get(attrs, :title),
+      url: Map.get(attrs, :url)
+    }
+
+    send_event({:memory_tracker_issue_create, attrs, issue})
+    {:ok, issue}
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
