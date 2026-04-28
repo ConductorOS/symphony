@@ -479,10 +479,10 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
-  defp default_turn_sandbox_policy(workspace) do
+  defp default_turn_sandbox_policy(writable_roots) when is_list(writable_roots) do
     %{
       "type" => "workspaceWrite",
-      "writableRoots" => [workspace],
+      "writableRoots" => writable_roots,
       "readOnlyAccess" => %{"type" => "fullAccess"},
       "networkAccess" => false,
       "excludeTmpdirEnvVar" => false,
@@ -490,19 +490,70 @@ defmodule SymphonyElixir.Config.Schema do
     }
   end
 
+  defp default_turn_sandbox_policy(workspace), do: default_turn_sandbox_policy([workspace])
+
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
     if Keyword.get(opts, :remote, false) do
       {:ok, default_turn_sandbox_policy(workspace_root)}
     else
       with expanded_workspace_root <- expand_local_workspace_root(workspace_root),
            {:ok, canonical_workspace_root} <- PathSafety.canonicalize(expanded_workspace_root) do
-        {:ok, default_turn_sandbox_policy(canonical_workspace_root)}
+        writable_roots =
+          canonical_workspace_root
+          |> git_worktree_writable_roots()
+          |> then(&[canonical_workspace_root | &1])
+          |> Enum.uniq()
+          |> prune_nested_roots()
+
+        {:ok, default_turn_sandbox_policy(writable_roots)}
       end
     end
   end
 
   defp default_runtime_turn_sandbox_policy(workspace_root, _opts) do
     {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, workspace_root}}}
+  end
+
+  defp git_worktree_writable_roots(workspace_root) do
+    ["--git-common-dir", "--git-dir"]
+    |> Enum.flat_map(&git_metadata_root(workspace_root, &1))
+    |> Enum.reject(&path_inside?(&1, workspace_root))
+    |> Enum.uniq()
+  end
+
+  defp git_metadata_root(workspace_root, git_rev_parse_arg) do
+    case System.cmd("git", ["-C", workspace_root, "rev-parse", "--path-format=absolute", git_rev_parse_arg], stderr_to_stdout: true) do
+      {path, 0} ->
+        path
+        |> String.trim()
+        |> canonical_git_metadata_root()
+
+      _ ->
+        []
+    end
+  end
+
+  defp canonical_git_metadata_root(""), do: []
+
+  defp canonical_git_metadata_root(path) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} -> [canonical_path]
+      {:error, _reason} -> []
+    end
+  end
+
+  defp path_inside?(path, parent) when is_binary(path) and is_binary(parent) do
+    path == parent or String.starts_with?(path, parent <> "/")
+  end
+
+  defp path_inside?(_path, _parent), do: false
+
+  defp prune_nested_roots(roots) when is_list(roots) do
+    roots
+    |> Enum.sort_by(&String.length/1)
+    |> Enum.reduce([], fn root, acc ->
+      if Enum.any?(acc, &path_inside?(root, &1)), do: acc, else: acc ++ [root]
+    end)
   end
 
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",

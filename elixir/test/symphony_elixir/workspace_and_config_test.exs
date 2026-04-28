@@ -1226,6 +1226,52 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "runtime sandbox policy includes git metadata root for source-backed worktrees" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-worktree-sandbox-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "MT-102")
+
+      File.mkdir_p!(source_repo)
+      File.mkdir_p!(workspace_root)
+      File.write!(Path.join(source_repo, "README.md"), "# test\n")
+
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source_repo, "add", "README.md"])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "initial"])
+      System.cmd("git", ["-C", source_repo, "worktree", "add", "-b", "symphony/MT-102", issue_workspace, "HEAD"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      settings = Config.settings!()
+
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
+      assert {:ok, canonical_git_common_dir} =
+               SymphonyElixir.PathSafety.canonicalize(Path.join(source_repo, ".git"))
+
+      assert {:ok, policy} = Schema.resolve_runtime_turn_sandbox_policy(settings, issue_workspace)
+
+      assert policy["type"] == "workspaceWrite"
+      assert canonical_issue_workspace in policy["writableRoots"]
+      assert canonical_git_common_dir in policy["writableRoots"]
+
+      refute Enum.any?(policy["writableRoots"], fn root ->
+               String.ends_with?(root, ".git/worktrees/MT-102")
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workflow prompt is used when building base prompt" do
     workflow_prompt = "Workflow prompt body used as codex instruction."
 
